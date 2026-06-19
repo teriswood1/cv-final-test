@@ -1,0 +1,18 @@
+Metric,Value
+Eval Loss,0.287043
+Pixel Accuracy,0.931919
+Mean IoU,0.708121
+
+Class,IoU
+class_0,0.939690
+class_1,0.861216
+class_2,0.121077
+class_3,0.973213
+class_4,0.895228
+class_5,0.897494
+class_6,0.595627
+class_7,0.653914
+class_8,0.868865
+class_9,0.575431
+class_10,0.828178
+class_11,0.287526

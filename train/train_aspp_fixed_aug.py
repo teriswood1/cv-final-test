@@ -1,0 +1,96 @@
+"""
+U-Net + ASPP + FixedAug（轻增强）训练脚本。
+
+目标：验证在修复 augment 逻辑后，使用更稳妥的数据增强和统一训练轮数，
+是否能超过旧的 unet_aspp_best（Test mIoU=0.5851）。
+"""
+
+from pathlib import Path
+import sys
+
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(PROJECT_ROOT))
+
+from models.unet_aspp import UNetASPP
+from utils.data_split import create_train_val_loaders, verify_augment_flags
+from utils.experiment import experiment_name_with_epochs
+from utils.metrics import SegmentationMetric
+from utils.train_engine import run_training
+
+
+def main():
+    num_classes = 12
+    image_size = (360, 480)
+    base_channels = 32
+    batch_size = 2
+    num_epochs = 50
+    learning_rate = 1e-4
+    val_ratio = 0.2
+    random_seed = 42
+    exp_name = experiment_name_with_epochs("unet_aspp_fixed_aug", num_epochs)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("=" * 80)
+    print("U-Net + ASPP Training (Fixed Aug, 30 Epochs)")
+    print("=" * 80)
+    print(f"实验名: {exp_name}")
+    print(f"设备: {device}")
+
+    data_root = PROJECT_ROOT / "data" / "raw"
+    output_dir = PROJECT_ROOT / "outputs"
+    checkpoint_dir = output_dir / "checkpoints"
+    log_dir = output_dir / "logs"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    train_loader, val_loader, info = create_train_val_loaders(
+        image_dir=data_root / "train" / "images",
+        label_dir=data_root / "train" / "labels",
+        image_size=image_size,
+        batch_size=batch_size,
+        val_ratio=val_ratio,
+        random_seed=random_seed,
+        device_type=device.type,
+        train_augment_mode="light",
+    )
+    verify_augment_flags(train_loader.dataset, val_loader.dataset)
+    print(
+        f"训练 {info['train_size']} augment={info['train_augment']} mode={info['train_augment_mode']}"
+    )
+    print(f"验证 {info['val_size']} augment={info['val_augment']}")
+
+    model = UNetASPP(3, num_classes, base_channels).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = Adam(model.parameters(), lr=learning_rate)
+
+    run_training(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        device=device,
+        num_classes=num_classes,
+        num_epochs=num_epochs,
+        best_model_path=checkpoint_dir / f"{exp_name}_best.pth",
+        last_model_path=checkpoint_dir / f"{exp_name}_last.pth",
+        log_path=log_dir / f"{exp_name}_train_log.txt",
+        metric_class=SegmentationMetric,
+        checkpoint_extra={
+            "model_name": exp_name,
+            "base_channels": base_channels,
+            "loss": "ce",
+            "augment_fix": True,
+            "train_augment_mode": "light",
+            "num_epochs": num_epochs,
+        },
+    )
+
+
+if __name__ == "__main__":
+    main()
+

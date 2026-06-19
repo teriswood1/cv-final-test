@@ -1,0 +1,10 @@
+Experiment,Prefix,Loss,Pixel Accuracy,Mean IoU
+DeepLabV3-ResNet50 pretrained,deeplabv3_resnet50_pretrained_road_e50,0.287043,0.931919,0.708121
+Pretrained Swin-UNet,swin_unet_pretrained_e50,0.201861,0.933063,0.691668
+U-Net Baseline,unet_baseline_augfix_e50,0.355128,0.892028,0.600185
+TransUNet,transunet_e50,0.316690,0.902656,0.588982
+U-Net + ASPP + WCE,unet_aspp_weighted_ce_e50,0.523465,0.882595,0.587356
+U-Net + ASPP,unet_aspp_fixed_aug_e50,0.270272,0.915694,0.568018
+U-Net + Baseline WCE,unet_baseline_wce_e50,0.420052,0.842551,0.559326
+U-Net + CBAM + ASPP,unet_cbam_aspp_augfix_e50,0.281705,0.908615,0.557352
+U-Net + CBAM,unet_cbam_augfix_e50,0.331968,0.896127,0.540934

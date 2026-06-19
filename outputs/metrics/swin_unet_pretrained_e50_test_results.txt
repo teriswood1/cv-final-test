@@ -1,0 +1,19 @@
+Pretrained Swin-UNet Test Results
+============================================================
+Test Loss: 0.201861
+Pixel Accuracy: 0.933063
+Mean IoU: 0.691668
+
+Class IoU:
+class_0: 0.936899
+class_1: 0.877596
+class_2: 0.093113
+class_3: 0.970645
+class_4: 0.883209
+class_5: 0.907426
+class_6: 0.575193
+class_7: 0.635926
+class_8: 0.855118
+class_9: 0.531460
+class_10: 0.759433
+class_11: 0.273996
