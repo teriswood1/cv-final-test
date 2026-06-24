@@ -1,0 +1,15 @@
+ViT/train/
+ViT/test/
+ViT/outputs/
+ViT/**/*.pth
+ViT/**/*.pt
+ViT/**/*.ckpt
+ViT/**/*.onnx
+ViT/**/*.png
+ViT/**/*.jpg
+ViT/**/*.jpeg
+ViT/**/*.pdf
+ViT/**/*.pptx
+ViT/**/*.docx
+ViT/**/__pycache__/
+ViT/**/*.pyc

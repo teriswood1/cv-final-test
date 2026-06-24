@@ -4,19 +4,35 @@ import random
 from dataclasses import dataclass
 from typing import List, Tuple
 
-import albumentations as A
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from albumentations.pytorch import ToTensorV2
+from PIL import Image, ImageEnhance
 from torch.utils.data import DataLoader, Dataset
-from transformers import SegformerForSemanticSegmentation
+from transformers import SegformerConfig, SegformerForSemanticSegmentation
+
+from models.vehicle_scene_relation_attention import add_vehicle_scene_relation_attention
 
 
-CLASS_NAMES = ["Road", "Vegetation", "Water", "Building", "Vehicle", "Person"]
-NUM_CLASSES = 6
+CLASS_NAMES = [
+    "Sky",
+    "Building",
+    "Pole",
+    "Road",
+    "Pavement",
+    "Tree",
+    "SignSymbol",
+    "Fence",
+    "Car",
+    "Pedestrian",
+    "Bicyclist",
+    "Unlabelled",
+]
+NUM_CLASSES = 12
 IGNORE_INDEX = 255
+IMAGE_MEAN = np.array((0.485, 0.456, 0.406), dtype=np.float32)
+IMAGE_STD = np.array((0.229, 0.224, 0.225), dtype=np.float32)
 
 # ==== 可选参数（按需手动修改） ====
 TRAIN_IMAGES = "train/images"
@@ -32,8 +48,11 @@ WEIGHT_DECAY = 0.01
 PATCH_SIZE = 256
 PATCHES_PER_IMAGE = 4
 SEED = 42
-OUTPUT_DIR = "outputs"
+OUTPUT_DIR = "outputs/segformer_camvid12_vsra"
 SAVE_BEST_ONLY = False
+ENABLE_RELATION_ATTENTION = True
+RELATION_CHANNELS = 64
+RELATION_POOL_SIZE = 16
 
 
 def set_seed(seed: int) -> None:
@@ -71,7 +90,7 @@ class UAVDataset(Dataset):
         patch_size: int = 512,
         patches_per_image: int = 4,
         is_train: bool = True,
-        transforms: A.Compose | None = None,
+        transforms: bool = False,
     ) -> None:
         self.image_dir = image_dir
         self.mask_dir = mask_dir
@@ -155,74 +174,98 @@ class UAVDataset(Dataset):
         if self.is_train:
             image, mask = self._random_patch(image, mask)
 
-        if self.transforms:
-            augmented = self.transforms(image=image, mask=mask)
-            image = augmented["image"]
+        if self.is_train and self.transforms:
+            image, mask = self._augment(image, mask)
             # 强制转为 long，满足 CrossEntropyLoss 的标签类型要求
-            mask = augmented["mask"].long()
-        else:
+        if True:
             # 默认将图像转为 CHW，并归一化到 [0, 1]
-            image = torch.from_numpy(image.transpose(2, 0, 1)).float() / 255.0
+            image = self._to_tensor(image)
             mask = torch.from_numpy(mask).long()
 
         return image, mask
 
     def _read_image(self, path: str) -> np.ndarray:
-        import cv2
+        image = Image.open(path).convert("RGB")
 
         # OpenCV 读入为 BGR，这里转为 RGB
-        image = cv2.imread(path, cv2.IMREAD_COLOR)
+        return np.array(image)
         if image is None:
             raise FileNotFoundError(f"读取图像失败: {path}")
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        return image
 
     def _read_mask(self, path: str) -> np.ndarray:
-        import cv2
+        mask_image = Image.open(path).convert("L")
 
-        mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        mask = np.array(mask_image, dtype=np.int64)
         if mask is None:
             raise FileNotFoundError(f"读取标签失败: {path}")
-        mask = mask.astype(np.int64)
         # 非法标签统一映射为 ignore_index，避免干扰训练与评估
         mask[(mask < 0) | (mask >= NUM_CLASSES)] = IGNORE_INDEX
         return mask
 
+    def _augment(self, image: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if random.random() < 0.5:
+            k = random.randint(1, 3)
+            image = np.rot90(image, k).copy()
+            mask = np.rot90(mask, k).copy()
 
-def get_train_transforms() -> A.Compose:
+        if random.random() < 0.5:
+            image = np.flip(image, axis=1).copy()
+            mask = np.flip(mask, axis=1).copy()
+
+        if random.random() < 0.5:
+            image = np.flip(image, axis=0).copy()
+            mask = np.flip(mask, axis=0).copy()
+
+        if random.random() < 0.5:
+            pil_image = Image.fromarray(image)
+            pil_image = ImageEnhance.Brightness(pil_image).enhance(random.uniform(0.8, 1.2))
+            pil_image = ImageEnhance.Contrast(pil_image).enhance(random.uniform(0.8, 1.2))
+            pil_image = ImageEnhance.Color(pil_image).enhance(random.uniform(0.8, 1.2))
+            image = np.array(pil_image)
+
+        return image, mask
+
+    def _to_tensor(self, image: np.ndarray) -> torch.Tensor:
+        image = image.astype(np.float32) / 255.0
+        image = (image - IMAGE_MEAN) / IMAGE_STD
+        return torch.from_numpy(image.transpose(2, 0, 1)).float()
+
+
+def get_train_transforms() -> bool:
     # 训练增强：旋转/翻转/颜色扰动 + ImageNet 归一化
-    return A.Compose(
-        [
-            A.RandomRotate90(p=0.5),
-            A.HorizontalFlip(p=0.5),
-            A.VerticalFlip(p=0.5),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2(),
-        ]
-    )
+    return True
 
 
-def get_val_transforms() -> A.Compose:
+def get_val_transforms() -> bool:
     # 验证只做归一化，保证评估稳定
-    return A.Compose(
-        [
-            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2(),
-        ]
-    )
+    return False
 
 
-def get_segformer_model() -> SegformerForSemanticSegmentation:
-    model = SegformerForSemanticSegmentation.from_pretrained(
-        "nvidia/mit-b1",
-        num_labels=NUM_CLASSES,
-        ignore_mismatched_sizes=True,
-        use_safetensors=True,
-    )
+def get_segformer_model(pretrained: bool = True) -> nn.Module:
+    if pretrained:
+        model = SegformerForSemanticSegmentation.from_pretrained(
+            "nvidia/mit-b1",
+            num_labels=NUM_CLASSES,
+            ignore_mismatched_sizes=True,
+            use_safetensors=True,
+            local_files_only=True,
+        )
+    else:
+        config = SegformerConfig.from_pretrained(
+            "nvidia/mit-b1",
+            num_labels=NUM_CLASSES,
+            local_files_only=True,
+        )
+        model = SegformerForSemanticSegmentation(config)
     model.config.num_labels = NUM_CLASSES
     # 告诉 SegFormer 训练/评估时忽略背景标签
     model.config.semantic_loss_ignore_index = IGNORE_INDEX
+    if ENABLE_RELATION_ATTENTION:
+        model = add_vehicle_scene_relation_attention(
+            model,
+            relation_channels=RELATION_CHANNELS,
+            pool_size=RELATION_POOL_SIZE,
+        )
     return model
 
 
@@ -448,7 +491,8 @@ def main() -> None:
     # 构建数据与模型
     train_loader, val_loader = build_loaders(cfg)
 
-    model = get_segformer_model().to(cfg.device)
+    resume_available = os.path.exists(last_model_path)
+    model = get_segformer_model(pretrained=not resume_available).to(cfg.device)
     criterion = HybridLoss(NUM_CLASSES, IGNORE_INDEX)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.epochs)
@@ -460,19 +504,61 @@ def main() -> None:
     history_miou: List[float] = []
     history_iou: List[List[float]] = []
     best_miou = -1.0
+    start_epoch = 1
+    append_log = False
 
-    with open(log_path, mode="w", newline="", encoding="utf-8") as log_file:
-        writer = csv.writer(log_file)
-        header = [
-            "epoch",
-            "train_loss",
-            "val_loss",
-            "pa",
-            "miou",
-        ] + [f"iou_{name.lower()}" for name in CLASS_NAMES]
-        writer.writerow(header)
+    if os.path.exists(log_path):
+        with open(log_path, mode="r", newline="", encoding="utf-8") as log_file:
+            reader = csv.reader(log_file)
+            header = next(reader, None)
+            for row in reader:
+                if len(row) < 5:
+                    continue
+                history_epochs.append(int(row[0]))
+                history_train_loss.append(float(row[1]))
+                history_val_loss.append(float(row[2]))
+                history_pa.append(float(row[3]))
+                history_miou.append(float(row[4]))
+                history_iou.append([float(value) for value in row[5:]])
+        if history_miou:
+            best_miou = max(history_miou)
 
-    for epoch in range(1, cfg.epochs + 1):
+    if os.path.exists(last_model_path):
+        checkpoint = torch.load(last_model_path, map_location=cfg.device)
+        if checkpoint.get("num_classes") != NUM_CLASSES:
+            raise ValueError(
+                f"Checkpoint num_classes={checkpoint.get('num_classes')} "
+                f"does not match current NUM_CLASSES={NUM_CLASSES}"
+            )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        else:
+            for _ in range(int(checkpoint.get("epoch", 0))):
+                scheduler.step()
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        append_log = os.path.exists(log_path)
+        print(f"Resuming from epoch {start_epoch}/{cfg.epochs}; best mIoU={best_miou:.4f}")
+
+    if start_epoch > cfg.epochs:
+        print(f"Training already reached epoch {start_epoch - 1}/{cfg.epochs}.")
+        return
+
+    if not append_log:
+        with open(log_path, mode="w", newline="", encoding="utf-8") as log_file:
+            writer = csv.writer(log_file)
+            header = [
+                "epoch",
+                "train_loss",
+                "val_loss",
+                "pa",
+                "miou",
+            ] + [f"iou_{name.lower()}" for name in CLASS_NAMES]
+            writer.writerow(header)
+
+    for epoch in range(start_epoch, cfg.epochs + 1):
         # 每个 epoch 输出训练/验证损失与分割指标
         train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, criterion, cfg.device)
         val_loss, pixel_acc, iou_list, miou = evaluate(model, val_loader, criterion, cfg.device)
@@ -504,6 +590,13 @@ def main() -> None:
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "miou": miou,
+                    "num_classes": NUM_CLASSES,
+                    "class_names": CLASS_NAMES,
+                    "relation_attention": ENABLE_RELATION_ATTENTION,
+                    "relation_channels": RELATION_CHANNELS,
+                    "relation_pool_size": RELATION_POOL_SIZE,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "config": cfg.__dict__,
                 },
                 best_model_path,
@@ -515,6 +608,13 @@ def main() -> None:
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "miou": miou,
+                    "num_classes": NUM_CLASSES,
+                    "class_names": CLASS_NAMES,
+                    "relation_attention": ENABLE_RELATION_ATTENTION,
+                    "relation_channels": RELATION_CHANNELS,
+                    "relation_pool_size": RELATION_POOL_SIZE,
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "config": cfg.__dict__,
                 },
                 last_model_path,

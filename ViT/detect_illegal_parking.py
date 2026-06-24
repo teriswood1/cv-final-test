@@ -23,24 +23,47 @@ from skimage.measure import label, regionprops
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 # 输入：语义分割输出目录（来自 infer_segformer.py）
-MASK_DIR = PROJECT_ROOT / "outputs" / "predictions_train"
+MASK_DIR = PROJECT_ROOT / "outputs" / "predictions_camvid12_train"
 
 # 原图目录：用于画框与保存可视化
 IMAGE_DIR = PROJECT_ROOT / "train" / "images"
 
 # 输出目录
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "illegal_parking_train"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "illegal_parking_camvid12_train"
 
 # 类别索引（与 infer_segformer.py 保持一致）
-ROAD_CLASS = 0
-VEHICLE_CLASS = 4
-PERSON_CLASS = 5
-VEGETATION_CLASS = 1
-WATER_CLASS = 2
-BUILDING_CLASS = 3
+SKY_CLASS = 0
+BUILDING_CLASS = 1
+POLE_CLASS = 2
+ROAD_CLASS = 3
+PAVEMENT_CLASS = 4
+TREE_CLASS = 5
+SIGN_SYMBOL_CLASS = 6
+FENCE_CLASS = 7
+VEHICLE_CLASS = 8
+PERSON_CLASS = 9
+BICYCLIST_CLASS = 10
+UNLABELLED_CLASS = 11
 
 # 认为是“非道路禁停区域”的类别，可按需求调整
-FORBIDDEN_CLASSES = {VEGETATION_CLASS, WATER_CLASS, BUILDING_CLASS, PERSON_CLASS}
+FORBIDDEN_CLASSES = {
+    BUILDING_CLASS,
+    POLE_CLASS,
+    PAVEMENT_CLASS,
+    TREE_CLASS,
+    SIGN_SYMBOL_CLASS,
+    FENCE_CLASS,
+    PERSON_CLASS,
+    BICYCLIST_CLASS,
+}
+
+STATIC_OBSTACLE_CLASSES = {
+    BUILDING_CLASS,
+    POLE_CLASS,
+    TREE_CLASS,
+    SIGN_SYMBOL_CLASS,
+    FENCE_CLASS,
+}
 
 # 过滤小噪声连通域
 MIN_VEHICLE_AREA = 80
@@ -50,6 +73,8 @@ FORBIDDEN_CONTEXT_THRESHOLD = 0.35
 
 # 判定阈值：车辆外扩上下文中，道路像素占比过低时更可疑
 ROAD_CONTEXT_THRESHOLD = 0.25
+PAVEMENT_CONTEXT_THRESHOLD = 0.35
+RELATION_SCORE_THRESHOLD = 0.55
 
 # 车辆外接框外扩像素，越大越看“周边环境”
 CONTEXT_MARGIN = 18
@@ -57,6 +82,17 @@ CONTEXT_MARGIN = 18
 # 画框颜色（BGR）
 FLAG_COLOR = (0, 0, 255)
 NORMAL_COLOR = (0, 255, 0)
+
+
+@dataclass
+class RelationFeatures:
+    road_context_ratio: float
+    pavement_context_ratio: float
+    forbidden_context_ratio: float
+    static_obstacle_context_ratio: float
+    vehicle_coverage: float
+    relation_score: float
+    is_illegal: bool
 
 
 @dataclass
@@ -69,8 +105,12 @@ class ParkingResult:
     h: int
     area: int
     road_context_ratio: float
+    pavement_context_ratio: float
     forbidden_context_ratio: float
+    static_obstacle_context_ratio: float
     vehicle_coverage: float
+    relation_score: float
+    risk_level: str
     is_illegal: bool
 
 
@@ -113,6 +153,69 @@ def crop_with_margin(
     x1 = min(width, x + w + margin)
     y1 = min(height, y + h + margin)
     return mask[y0:y1, x0:x1], (x0, y0, x1, y1)
+
+
+def compute_relation_features(
+    mask: np.ndarray,
+    component_mask: np.ndarray,
+    x: int,
+    y: int,
+    w: int,
+    h: int,
+    margin: int = CONTEXT_MARGIN,
+) -> RelationFeatures:
+    context_crop, (x0, y0, x1, y1) = crop_with_margin(mask, x, y, w, h, margin)
+    crop_vehicle = component_mask[y0:y1, x0:x1]
+    context_area = int(context_crop.size - crop_vehicle.sum())
+    if context_area <= 0:
+        return RelationFeatures(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, False)
+
+    context_without_vehicle = context_crop[~crop_vehicle]
+    road_pixels = int((context_without_vehicle == ROAD_CLASS).sum())
+    pavement_pixels = int((context_without_vehicle == PAVEMENT_CLASS).sum())
+    forbidden_pixels = int(np.isin(context_without_vehicle, list(FORBIDDEN_CLASSES)).sum())
+    static_obstacle_pixels = int(
+        np.isin(context_without_vehicle, list(STATIC_OBSTACLE_CLASSES)).sum()
+    )
+
+    road_context_ratio = road_pixels / context_area
+    pavement_context_ratio = pavement_pixels / context_area
+    forbidden_context_ratio = forbidden_pixels / context_area
+    static_obstacle_context_ratio = static_obstacle_pixels / context_area
+    vehicle_coverage = int(component_mask.sum()) / float((x1 - x0) * (y1 - y0))
+
+    relation_score = (
+        0.55 * pavement_context_ratio
+        + 0.30 * static_obstacle_context_ratio
+        + 0.15 * max(0.0, 1.0 - road_context_ratio)
+        + 0.15 * forbidden_context_ratio
+    )
+    relation_score = float(min(1.0, max(0.0, relation_score)))
+    is_illegal = (
+        relation_score >= RELATION_SCORE_THRESHOLD
+        or (
+            pavement_context_ratio >= PAVEMENT_CONTEXT_THRESHOLD
+            and road_context_ratio <= ROAD_CONTEXT_THRESHOLD
+        )
+    )
+
+    return RelationFeatures(
+        road_context_ratio=road_context_ratio,
+        pavement_context_ratio=pavement_context_ratio,
+        forbidden_context_ratio=forbidden_context_ratio,
+        static_obstacle_context_ratio=static_obstacle_context_ratio,
+        vehicle_coverage=vehicle_coverage,
+        relation_score=relation_score,
+        is_illegal=is_illegal,
+    )
+
+
+def risk_level(relation_score: float, is_illegal: bool) -> str:
+    if is_illegal:
+        return "illegal"
+    if relation_score >= 0.40:
+        return "suspicious"
+    return "normal"
 
 
 def infer_image_path_from_mask(mask_path: Path) -> Path:
@@ -190,15 +293,25 @@ def detect_from_mask(mask_path: Path) -> Tuple[List[ParkingResult], np.ndarray]:
 
         context_without_vehicle = context_crop[~crop_vehicle]
         road_pixels = int((context_without_vehicle == ROAD_CLASS).sum())
+        pavement_pixels = int((context_without_vehicle == PAVEMENT_CLASS).sum())
         forbidden_pixels = int(np.isin(context_without_vehicle, list(FORBIDDEN_CLASSES)).sum())
+        static_obstacle_pixels = int(
+            np.isin(context_without_vehicle, list(STATIC_OBSTACLE_CLASSES)).sum()
+        )
 
         road_context_ratio = road_pixels / context_area
+        pavement_context_ratio = pavement_pixels / context_area
         forbidden_context_ratio = forbidden_pixels / context_area
+        static_obstacle_context_ratio = static_obstacle_pixels / context_area
         vehicle_coverage = component_area / float((x1 - x0) * (y1 - y0))
+        features = compute_relation_features(mask, component_mask, x, y, w, h)
 
         is_illegal = (
-            forbidden_context_ratio >= FORBIDDEN_CONTEXT_THRESHOLD
-            and road_context_ratio <= ROAD_CONTEXT_THRESHOLD
+            features.is_illegal
+            or (
+                forbidden_context_ratio >= FORBIDDEN_CONTEXT_THRESHOLD
+                and road_context_ratio <= ROAD_CONTEXT_THRESHOLD
+            )
         )
 
         results.append(
@@ -211,8 +324,12 @@ def detect_from_mask(mask_path: Path) -> Tuple[List[ParkingResult], np.ndarray]:
                 h=h,
                 area=component_area,
                 road_context_ratio=road_context_ratio,
+                pavement_context_ratio=pavement_context_ratio,
                 forbidden_context_ratio=forbidden_context_ratio,
+                static_obstacle_context_ratio=static_obstacle_context_ratio,
                 vehicle_coverage=vehicle_coverage,
+                relation_score=features.relation_score,
+                risk_level=risk_level(features.relation_score, is_illegal),
                 is_illegal=is_illegal,
             )
         )
@@ -234,8 +351,12 @@ def save_csv(results: Sequence[ParkingResult], csv_path: Path) -> None:
                 "h",
                 "area",
                 "road_context_ratio",
+                "pavement_context_ratio",
                 "forbidden_context_ratio",
+                "static_obstacle_context_ratio",
                 "vehicle_coverage",
+                "relation_score",
+                "risk_level",
                 "is_illegal",
             ]
         )
@@ -250,8 +371,12 @@ def save_csv(results: Sequence[ParkingResult], csv_path: Path) -> None:
                     item.h,
                     item.area,
                     f"{item.road_context_ratio:.6f}",
+                    f"{item.pavement_context_ratio:.6f}",
                     f"{item.forbidden_context_ratio:.6f}",
+                    f"{item.static_obstacle_context_ratio:.6f}",
                     f"{item.vehicle_coverage:.6f}",
+                    f"{item.relation_score:.6f}",
+                    item.risk_level,
                     int(item.is_illegal),
                 ]
             )
@@ -275,10 +400,10 @@ def main() -> None:
             box = (item.x, item.y, item.w, item.h)
             if item.is_illegal:
                 illegal_count += 1
-                text = f"ILLEGAL {item.forbidden_context_ratio:.2f}"
+                text = f"ILLEGAL {item.relation_score:.2f}"
                 image = draw_result_box(image, box, text, FLAG_COLOR)
             else:
-                text = f"OK {item.forbidden_context_ratio:.2f}"
+                text = f"{item.risk_level.upper()} {item.relation_score:.2f}"
                 image = draw_result_box(image, box, text, NORMAL_COLOR)
 
         out_image = OUTPUT_DIR / f"{mask_path.name.replace('_mask.png', '')}_illegal_parking.png"

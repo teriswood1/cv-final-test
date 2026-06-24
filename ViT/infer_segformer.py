@@ -5,16 +5,21 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from transformers import SegformerForSemanticSegmentation
+from transformers import SegformerConfig, SegformerForSemanticSegmentation
+
+from models.vehicle_scene_relation_attention import add_vehicle_scene_relation_attention
 
 
 # ==== 可选参数（按需手动修改） ====
-CHECKPOINT_PATH = "outputs/best_model.pth"
+CHECKPOINT_PATH = "outputs/segformer_camvid12_vsra/best_model.pth"
 INPUT_PATH = "train/images"
-OUTPUT_DIR = "outputs/predictions_train"
-NUM_CLASSES = 6
+OUTPUT_DIR = "outputs/predictions_camvid12_vsra_train"
+NUM_CLASSES = 12
 IGNORE_INDEX = 255
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ENABLE_RELATION_ATTENTION = True
+RELATION_CHANNELS = 64
+RELATION_POOL_SIZE = 16
 # 是否保存彩色分割图与叠加可视化
 SAVE_COLOR = True
 SAVE_OVERLAY = True
@@ -22,24 +27,36 @@ OVERLAY_ALPHA = 0.6
 
 # Palette for classes (RGB tuples) — 可按需修改
 PALETTE = [
-    (128, 64, 128),  # Road (dark purple)
-    (107, 142, 35),  # Vegetation (olive)
-    (0, 0, 255),     # Water (blue)
-    (70, 70, 70),    # Building (dark gray)
-    (0, 0, 142),     # Vehicle (dark blue)
-    (220, 20, 60),   # Person (red)
+    (128, 128, 128),  # Sky
+    (128, 0, 0),      # Building
+    (192, 192, 128),  # Pole
+    (128, 64, 128),   # Road
+    (60, 40, 222),    # Pavement
+    (128, 128, 0),    # Tree
+    (192, 128, 128),  # SignSymbol
+    (64, 64, 128),    # Fence
+    (64, 0, 128),     # Car
+    (64, 64, 0),      # Pedestrian
+    (0, 128, 192),    # Bicyclist
+    (0, 0, 0),        # Unlabelled
 ]
 
 
 def get_segformer_model() -> SegformerForSemanticSegmentation:
-    model = SegformerForSemanticSegmentation.from_pretrained(
+    config = SegformerConfig.from_pretrained(
         "nvidia/mit-b1",
         num_labels=NUM_CLASSES,
-        ignore_mismatched_sizes=True,
-        use_safetensors=True,
+        local_files_only=True,
     )
+    model = SegformerForSemanticSegmentation(config)
     model.config.num_labels = NUM_CLASSES
     model.config.semantic_loss_ignore_index = IGNORE_INDEX
+    if ENABLE_RELATION_ATTENTION:
+        model = add_vehicle_scene_relation_attention(
+            model,
+            relation_channels=RELATION_CHANNELS,
+            pool_size=RELATION_POOL_SIZE,
+        )
     return model
 
 
